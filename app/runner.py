@@ -1,0 +1,303 @@
+"""Execute one claimed run of the supervisor, step by step."""
+
+import time
+from collections.abc import Callable
+
+from app.agents import SUPERVISOR_SYSTEM, SupervisorTools, run_tool
+from app.idempotency import idempotency_key
+from app.leave_db import LeaveDb
+from app.memory import Claimed, RunStore
+from app.providers import AgentError
+
+
+MAX_STEPS = 10
+
+
+class LeaseLost(Exception):
+    """Another worker owns this run now. Stop without writing anything else."""
+
+
+def rebuild(store: RunStore, thread_id: str, run_id: str):
+    """Rebuild model context from persisted history and run steps."""
+
+    contents = [
+        {"role": m["role"], "text": m["text"]}
+        for m in store.load_history(thread_id)
+    ]
+
+    seq = 0
+    pending = []
+    final_text = None
+
+    for step in store.load_steps(run_id):
+
+        if step["kind"] == "model":
+
+            calls = step["tool_calls"] or []
+
+            if not calls:
+                final_text = step["text"] or ""
+                seq = step["seq"]
+                continue
+
+            contents.append({
+                "role": "model",
+                "text": step["text"],
+                "tool_calls": calls,
+            })
+
+            pending = [
+                (step["seq"] + i + 1, call)
+                for i, call in enumerate(calls)
+            ]
+
+            seq = step["seq"] + len(calls)
+
+        else:
+
+            contents.append({
+                "role": "tool",
+                "name": step["tool_name"],
+                "result": step["result"],
+            })
+
+            pending = [
+                p for p in pending
+                if p[0] != step["seq"]
+            ]
+
+    return contents, seq, pending, final_text
+
+
+def execute_run(
+    claimed: Claimed,
+    *,
+    store: RunStore,
+    db: LeaveDb,
+    providers: dict,
+    worker_id: str,
+    lease_seconds: float,
+    on_step: Callable[[dict], None] | None = None,
+    record_delay: float = 0.0,
+) -> str:
+
+    run_id = claimed.run_id
+
+    thread = store.get_thread(claimed.thread_id)
+
+    # Leave domain uses student_id.
+    # The agent DB stores it as TEXT, so convert it to int
+    # for the domain database/tools.
+    student_id = int(thread["student_id"])
+
+    system = SUPERVISOR_SYSTEM.format(
+        student_id=student_id
+    )
+
+    tools = SupervisorTools(
+        db=db,
+        providers=providers,
+        student_id=student_id,
+        store=store,
+        on_step=on_step,
+    )
+
+    provider = providers["supervisor"]
+
+    functions = list(
+        tools.functions().values()
+    )
+
+    contents, seq, pending, final_text = rebuild(
+        store,
+        claimed.thread_id,
+        run_id,
+    )
+
+    def between_steps() -> str | None:
+
+        if store.cancel_requested(run_id):
+
+            if not store.mark_cancelled(
+                run_id,
+                worker_id,
+            ):
+                raise LeaseLost()
+
+            return "cancelled"
+
+        if not store.heartbeat(
+            run_id,
+            worker_id,
+            lease_seconds,
+        ):
+            raise LeaseLost()
+
+        return None
+
+    # Crash happened after model answer was recorded
+    # but before the run was marked completed.
+    if final_text is not None:
+
+        if not store.complete(
+            run_id,
+            worker_id,
+            final_text,
+        ):
+            raise LeaseLost()
+
+        return "succeeded"
+
+    while True:
+
+        # ---------------------------------------------------------
+        # Execute pending tool calls
+        # ---------------------------------------------------------
+
+        for step_seq, call in pending:
+
+            if stop := between_steps():
+                return stop
+
+            key = idempotency_key(
+                run_id,
+                step_seq,
+                call["name"],
+                call["args"],
+            )
+
+            started = time.perf_counter()
+
+            result, replayed = run_tool(
+                tools,
+                db,
+                key,
+                call["name"],
+                call["args"],
+            )
+
+            ms = round(
+                (time.perf_counter() - started) * 1000
+            )
+
+            ok = "error" not in result
+
+            # Used by crash/replay demonstration.
+            if record_delay:
+                time.sleep(record_delay)
+
+            store.record_tool_call(
+                run_id,
+                step_seq,
+                call["name"],
+                call["args"],
+                result,
+                ok,
+                ms,
+                key,
+            )
+
+            contents.append({
+                "role": "tool",
+                "name": call["name"],
+                "result": result,
+            })
+
+            if on_step:
+                on_step({
+                    "agent": "supervisor",
+                    "run_id": run_id,
+                    "step": step_seq,
+                    "kind": "tool",
+                    "tool": call["name"],
+                    "args": call["args"],
+                    "result": result,
+                    "ok": ok,
+                    "ms": ms,
+                    "replayed": replayed,
+                })
+
+        pending = []
+
+        # ---------------------------------------------------------
+        # Step limit
+        # ---------------------------------------------------------
+
+        if seq >= MAX_STEPS:
+
+            raise AgentError(
+                "step_limit",
+                f"Stopped after {MAX_STEPS} steps without an answer.",
+                retryable=False,
+            )
+
+        if stop := between_steps():
+            return stop
+
+        # ---------------------------------------------------------
+        # Ask supervisor model for next action
+        # ---------------------------------------------------------
+
+        turn = provider.generate(
+            system,
+            contents,
+            functions,
+        )
+
+        seq += 1
+
+        calls = [
+            {
+                "name": c.name,
+                "args": c.args,
+            }
+            for c in turn.tool_calls
+        ]
+
+        store.record_model_step(
+            run_id,
+            seq,
+            turn.tokens_in,
+            turn.tokens_out,
+            turn.text,
+            calls,
+        )
+
+        if on_step:
+            on_step({
+                "agent": "supervisor",
+                "run_id": run_id,
+                "step": seq,
+                "kind": "model",
+                "text": turn.text,
+                "tool_calls": calls,
+            })
+
+        # ---------------------------------------------------------
+        # Model finished without requesting a tool
+        # ---------------------------------------------------------
+
+        if not calls:
+
+            if not store.complete(
+                run_id,
+                worker_id,
+                turn.text or "",
+            ):
+                raise LeaseLost()
+
+            return "succeeded"
+
+        contents.append({
+            "role": "model",
+            "text": turn.text,
+            "raw": turn.raw,
+            "tool_calls": calls,
+        })
+
+        pending = [
+            (seq + i + 1, call)
+            for i, call in enumerate(calls)
+        ]
+
+        seq += len(calls)
